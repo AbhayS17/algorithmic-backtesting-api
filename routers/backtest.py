@@ -8,40 +8,72 @@ from schemas import BacktestResult
 # Create the mini-app
 router = APIRouter()
 
-# Notice it says @router.get now, instead of @app.get!
-@router.get("/backtest")
-def run_backtest(ticker: str = "AAPL", short_window: int = Query(20, ge=5, le=50), long_window: int = Query(50, ge=40, le=200)):
-    stock = yf.Ticker(ticker)
-    df = stock.history(period="1y")
-    if df.empty:
-        return {"error": "No data found"}
-        
-    df["Short_SMA"] = df["Close"].rolling(window=short_window).mean()
-    df["Long_SMA"] = df["Close"].rolling(window=long_window).mean()
-    df = df.dropna(subset=["Short_SMA", "Long_SMA"]).copy()
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from data_engine import MarketDataEngine
+from strategy_engine import SMACrossoverStrategy, BuyAndHoldStrategy, MACDStrategy
+
+router = APIRouter()
+
+# --- 1. The Strategy Factory (The Switchboard) ---
+# This maps a string name to the actual Python Class Object
+STRATEGY_MAP = {
+    "SMA": SMACrossoverStrategy(),
+    "HOLD": BuyAndHoldStrategy(),
+    "MACD": MACDStrategy()
+}
+
+# --- 2. The Dynamic Request Blueprint ---
+class BacktestRequest(BaseModel):
+    tickers: list[str]
+    start_date: str
+    end_date: str
+    strategy_name: str
+    # 'params' allows the user to send ANY custom variables (like short_window or fast_macd)
+    params: dict = {} 
+
+# --- 3. The Master POST Endpoint ---
+@router.post("/run")
+def run_portfolio_backtest(request: BacktestRequest):
     
-    df["Signal"] = 0
-    df.loc[df["Short_SMA"] > df["Long_SMA"], "Signal"] = 1
+    # 1. Select the correct algorithm brain
+    if request.strategy_name not in STRATEGY_MAP:
+        raise HTTPException(status_code=404, detail=f"Strategy '{request.strategy_name}' not found.")
     
-    df["Market_Return"] = df["Close"].pct_change()
-    df["Strategy_Return"] = df["Signal"].shift(1) * df["Market_Return"]
+    strategy = STRATEGY_MAP[request.strategy_name]
+
+    # 2. Fetch the clean data using our new Engine
+    try:
+        data_engine = MarketDataEngine(request.tickers, request.start_date, request.end_date)
+        portfolio_data = data_engine.fetch_data()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Data fetching error: {str(e)}")
+
+    # 3. Process the portfolio
+    portfolio_results = {}
     
-    cum_market = round(((1 + df["Market_Return"].dropna()).prod() - 1) * 100, 2)
-    cum_strategy = round(((1 + df["Strategy_Return"].dropna()).prod() - 1) * 100, 2)
-    
-    # Grab the database connection from our other file
-    conn, cursor = get_db_connection()
-    
-    cursor.execute("""
-        INSERT INTO backtest_results (ticker, short_window, long_window, market_return, strategy_return)
-        VALUES (?, ?, ?, ?, ?)
-    """, (ticker.upper(), short_window, long_window, cum_market, cum_strategy))
-    conn.commit()
-    
+    for ticker, df in portfolio_data.items():
+        # Pass the user's custom dictionary directly into the strategy's **kwargs!
+        signaled_df = strategy.generate_signals(df, **request.params)
+
+        # Calculate Returns
+        signaled_df['Market_Return'] = signaled_df['Close'].pct_change()
+        signaled_df['Strategy_Return'] = signaled_df['Signal'].shift(1) * signaled_df['Market_Return']
+
+        cum_market = round(((1 + signaled_df['Market_Return'].dropna()).prod() - 1) * 100, 2)
+        cum_strategy = round(((1 + signaled_df['Strategy_Return'].dropna()).prod() - 1) * 100, 2)
+
+        portfolio_results[ticker] = {
+            "market_return_pct": cum_market,
+            "strategy_return_pct": cum_strategy
+        }
+
+    # Return the aggregated report
     return {
-        "status": "Calculated and Saved",
-        "ticker": ticker.upper(),
-        "metrics": {"market_return_pct": cum_market, "strategy_return_pct": cum_strategy}
+        "status": "Success",
+        "strategy_executed": request.strategy_name,
+        "date_range": f"{request.start_date} to {request.end_date}",
+        "portfolio_results": portfolio_results
     }
 
 @router.get("/results")
