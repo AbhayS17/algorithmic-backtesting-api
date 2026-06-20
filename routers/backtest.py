@@ -4,6 +4,7 @@ import yfinance as yf
 import pandas as pd
 from database import get_db_connection
 from schemas import BacktestResult
+from optimization_engine import PortfolioOptimizer
 
 # Create the mini-app
 router = APIRouter()
@@ -84,3 +85,30 @@ def get_saved_results():
     
     formatted_results = [{"id": r[0], "ticker": r[1], "short_window": r[2], "long_window": r[3], "market_return": r[4], "strategy_return": r[5]} for r in raw_data]
     return {"history": formatted_results}
+
+# Create a new Pydantic blueprint for the optimization request
+class OptimizationRequest(BaseModel):
+    tickers: list[str]
+    start_date: str
+    end_date: str
+
+# The new API Endpoint
+@router.post("/optimize")
+def run_portfolio_optimization(request: OptimizationRequest):
+    try:
+        # 1. Fetch the data using our existing engine
+        data_engine = MarketDataEngine(request.tickers, request.start_date, request.end_date)
+        portfolio_data = data_engine.fetch_data()
+        
+        # 2. Run the optimization engine
+        optimizer = PortfolioOptimizer(portfolio_data)
+        optimal_results = optimizer.optimize_sharpe_ratio()
+        
+        return {
+            "status": "Success",
+            "date_range": f"{request.start_date} to {request.end_date}",
+            "optimization_metrics": optimal_results
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Optimization failed: {str(e)}")
